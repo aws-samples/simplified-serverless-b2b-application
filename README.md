@@ -1,4 +1,4 @@
-## My Project
+## Simplifying B2B integrations with AWS Step Functions Workflow Studio
 
 TODO: Fill this README out!
 
