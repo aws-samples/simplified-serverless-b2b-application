@@ -1,0 +1,797 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  SftpServerS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SftpAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: SftpAccessPolicy
+      Description: Sftp access policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+              - 's3:DeleteObject'
+              - 's3:GetObjectVersion'
+              - 's3:DeleteObjectVersion'
+            Resource: !Sub "${SftpServerS3Bucket.Arn}/test/*"
+          -
+            Effect: Allow
+            Action:
+              - 's3:ListBucket'
+              - 's3:GetBucketLocation'
+            Resource: !GetAtt SftpServerS3Bucket.Arn
+            Condition:
+              StringLike:
+                's3:prefix': 'test/*'
+
+  SftpAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'transfer.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Ref SftpAccessPolicy
+
+  SftpServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      EndpointType: PUBLIC
+
+  SftpUser:
+    Type: AWS::Transfer::User
+    Properties:
+      UserName: testuser
+      HomeDirectory: !Sub "/${SftpServerS3Bucket}/test"
+      Role: !GetAtt SftpAccessRole.Arn
+      ServerId: !GetAtt SftpServer.ServerId
+      SshPublicKeys:
+        - Ref: SshPublicKeyParameter
+  
+  CloudTrailS3Bucket: 
+      DeletionPolicy: Retain
+      Type: AWS::S3::Bucket
+      Properties: {}
+      
+  CloudTrailS3BucketPolicy: 
+      Type: AWS::S3::BucketPolicy
+      Properties: 
+        Bucket: 
+          Ref: CloudTrailS3Bucket
+        PolicyDocument: 
+          Version: "2012-10-17"
+          Statement: 
+            - 
+              Sid: "AWSCloudTrailAclCheck"
+              Effect: "Allow"
+              Principal: 
+                Service: "cloudtrail.amazonaws.com"
+              Action: "s3:GetBucketAcl"
+              Resource: 
+                !Sub |-
+                  arn:aws:s3:::${CloudTrailS3Bucket}
+            - 
+              Sid: "AWSCloudTrailWrite"
+              Effect: "Allow"
+              Principal: 
+                Service: "cloudtrail.amazonaws.com"
+              Action: "s3:PutObject"
+              Resource:
+                !Sub |-
+                  arn:aws:s3:::${CloudTrailS3Bucket}/AWSLogs/${AWS::AccountId}/*
+              Condition: 
+                StringEquals:
+                  s3:x-amz-acl: "bucket-owner-full-control"
+
+  CloudTrailDataEventsTrail: 
+      DependsOn: 
+        - CloudTrailS3BucketPolicy
+        - SftpServerS3Bucket
+      Type: AWS::CloudTrail::Trail
+      Properties: 
+        S3BucketName: 
+          Ref: CloudTrailS3Bucket
+        IsLogging: true
+        IsMultiRegionTrail: false
+        EventSelectors: 
+        - DataResources:
+            - Type: AWS::S3::Object
+              Values: 
+                - !Sub "${SftpServerS3Bucket.Arn}/"   
+          IncludeManagementEvents: No
+          ReadWriteType: All
+
+  EventBridgeCustomEventBus: 
+    Type: AWS::Events::EventBus
+    Properties: 
+        Name: "EventBridgeCustomEventBus"
+  
+  EventBridgeSftpS3BucketEventRule: 
+    DependsOn: 
+        - PopulateQueueLambdaFunction
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "EventBridgeSftpS3BucketEventRule"
+      EventPattern: 
+        source: 
+          - "aws.s3"
+        detail-type: 
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+          - "s3.amazonaws.com"
+          eventName:
+          - "PutObject"
+          requestParameters:
+            bucketName:
+            - !Sub "${SftpServerS3Bucket}"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "PopulateQueueLambdaFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda: 
+    DependsOn: 
+        - PopulateQueueLambdaFunction
+        - EventBridgeSftpS3BucketEventRule
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "PopulateQueueLambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventBridgeSftpS3BucketEventRule"
+          - "Arn"
+  
+  PopulateQueueLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Sid: "LambdaAccessToCreateCWLogGroup"
+            Effect: Allow 
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - 
+            Sid: "LambdaAccessToCreateCWLogEvents"
+            Effect: Allow 
+            Action:
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/PopulateQueueLambdaFunction:*"
+          - 
+            Sid: "LambdaAccessToSftpServerS3Bucket"
+            Effect: Allow
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${SftpServerS3Bucket}/*"
+          - 
+            Sid: "LambdaAccessToSqsQueue"
+            Effect: Allow
+            Action:
+            - "sqs:GetQueueUrl"
+            - "sqs:ChangeMessageVisibility"
+            - "sqs:ListDeadLetterSourceQueues"
+            - "sqs:SendMessageBatch"
+            - "sqs:PurgeQueue"
+            - "sqs:ReceiveMessage"
+            - "sqs:SendMessage"
+            - "sqs:GetQueueAttributes"
+            - "sqs:CreateQueue"
+            - "sqs:ListQueueTags"
+            - "sqs:ChangeMessageVisibilityBatch"
+            - "sqs:SetQueueAttributes"
+            Resource:
+              Fn::GetAtt: 
+                - "SqsQueue"
+                - "Arn"
+
+  SqsQueue: 
+    Type: AWS::SQS::Queue
+  
+  SingleQueueLambdaApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - apigateway.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Sid: "LambdaAccess"
+            Effect: Allow 
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt 'SingleQueueUploadLambda.Arn'
+          - 
+            Sid: "ApiGatewayAccessToCreateCWLogGroupAndPutEvents"
+            Effect: Allow 
+            Action: 
+            - "logs:CreateLogGroup"
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+  
+  ApiGatewayInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: 
+        Ref: "SingleQueueUploadLambda"
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SingleTransactionApiGateway}/*/*/*"
+    
+  SingleQueueUploadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Sid: "LambdaAccessToSqsQueue"
+            Effect: Allow 
+            Action: sqs:SendMessage
+            Resource: !GetAtt 'SqsQueue.Arn'
+          - 
+            Sid: "LambdaAccessToCreateCWLogGroup"
+            Effect: Allow 
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - 
+            Sid: "LambdaAccessToCreateCWLogEvents"
+            Effect: Allow 
+            Action:
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/SingleQueueUploadLambda:*"
+
+  SingleTransactionApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: SingleTransactionApiGateway
+  
+  SingleTransactionApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref SingleTransactionApiGateway
+      ResourceId: !GetAtt SingleTransactionApiGateway.RootResourceId
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.querystring.transactionId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SingleQueueUploadLambda.Arn}/invocations'
+      MethodResponses: 
+        - ResponseModels:
+            application/json: "Empty"
+          StatusCode: 200
+  
+  SingleTransactionApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SingleTransactionApiGatewayMethod
+    Properties:
+      RestApiId: !Ref SingleTransactionApiGateway
+      StageName: test
+  
+  SingleQueueUploadLambda:
+    DependsOn: 
+      - SqsQueue
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SingleQueueUploadLambda
+      Role: !GetAtt SingleQueueUploadLambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          
+          sqs_client = boto3.client('sqs')
+
+          queue_url = os.environ['sqsqueueurl']
+
+          def lambda_handler(event, context):
+            transactionId = event['queryStringParameters']['transactionId']
+            print(transactionId)
+            transactionMessage = event['queryStringParameters']['transactionMessage']
+            print(transactionMessage)
+            sqs_handler(transactionId, transactionMessage)
+            return {
+              'statusCode': 200,
+              'body': json.dumps('Great job!')
+            }
+
+          def sqs_handler(transactionId, transactionMessage):
+              response = sqs_client.send_message(
+              QueueUrl=queue_url,
+              DelaySeconds=0,
+              MessageAttributes={
+                  'TransactionID': {
+                      'DataType': 'Number',
+                      'StringValue': transactionId
+                  }
+              },
+              MessageBody=(
+                  transactionMessage
+                  )
+              )
+              print(response)
+      Environment:
+        Variables:
+          sqsqueueurl: !Ref SqsQueue
+            
+  PopulateQueueLambdaFunction:
+    DependsOn: 
+      - SqsQueue
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PopulateQueueLambdaFunction
+      Role: !GetAtt PopulateQueueLambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from xml.dom import minidom
+          import xml.etree.ElementTree as ET
+          import re
+
+          s3_client = boto3.client('s3') 
+          sqs_client = boto3.client('sqs')
+
+          queue_url = os.environ['sqsqueueurl']
+
+          def lambda_handler(event, context):
+              # Get only necessary data from Event JSON
+              detail = event['detail'] # Event JSON payload format: detail -> requestParameters -> bucketName and key
+              request_parameters = detail['requestParameters']
+              bucket_name = request_parameters['bucketName']
+              object_key = request_parameters['key']
+              
+              # get object rather than download file to save Lambda memory
+              try:
+                  input_object = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+              except:
+                  print("File does not exist in S3.")
+                  return("500")
+              
+              input_data = input_object['Body'].read()
+              
+              # file data will be a binary stream; have to decode it 
+              contents = input_data.decode('utf-8')
+              # print(contents)
+              
+              # establish tree and parse through lines and strip
+              root = ET.fromstring(contents)
+              # strip away the ID and content inside each transaction to be send to lambda funcitons to transform them into JSON
+              for child in root.iter():
+                if child.tag == 'Transaction':
+                  id = child.attrib['TransactionID']
+                  print(id)
+                  for child2 in child.iter():
+                    notes = getattr(child2.find('Notes'), 'text', None)
+                    if notes != None:
+                        sqs_handler(id,notes)
+                    print(notes)
+
+          def sqs_handler(transaction_id, note):
+              note_str = note
+              print(note_str)
+              response = sqs_client.send_message(
+              QueueUrl=queue_url,
+              DelaySeconds=0,
+              MessageAttributes={
+                  'TransactionID': {
+                      'DataType': 'Number',
+                      'StringValue': transaction_id
+                  }
+              },
+              MessageBody=(
+                  note_str
+                  )
+              )
+              print(response)
+      Environment:
+        Variables:
+          sqsqueueurl: !Ref SqsQueue
+  
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: transactions
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+  
+  DataEnrichmentApiGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref DataEnrichmentApiGateway
+      ResourceId: !GetAtt DataEnrichmentApiGateway.RootResourceId
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: HTTP
+        IntegrationHttpMethod: GET
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+        - StatusCode: 200
+        Uri: https://hub.dummyapis.com/employee?noofRecords=1
+      MethodResponses: 
+        - ResponseModels:
+            application/json: "Empty"
+          StatusCode: 200
+
+  DataEnrichmentApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Name: DataEnrichmentApiGateway
+
+  DataEnrichmentApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DataEnrichmentApiGatewayMethod
+    Properties:
+      RestApiId: !Ref DataEnrichmentApiGateway
+      StageName: test
+
+  IntakeSingleTransactionLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Sid: "LambdaAccessToCreateCWLogGroup"
+            Effect: Allow 
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - 
+            Sid: "LambdaAccessToCreateCWLogEvents"
+            Effect: Allow 
+            Action:
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/IntakeSingleTransactionLambdaFunction:*"
+          
+  IntakeSingleTransactionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IntakeSingleTransactionLambdaFunction
+      Role: !GetAtt IntakeSingleTransactionLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+            print("hi i'm here")
+            print(event)
+            message_id = event['id']
+            transaction_message = event['transaction_message']
+            return {
+                'messageId': event['id'],
+                'transactionMessage': event['transaction_message']
+            }
+
+  StatesExecutionRole:
+      Type: "AWS::IAM::Role"
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Service:
+                  - !Sub states.${AWS::Region}.amazonaws.com
+              Action: "sts:AssumeRole"
+        Path: "/"
+        Policies:
+          - PolicyName: StatesExecutionPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - 
+                  Sid: "LambdaAccess"
+                  Effect: Allow
+                  Action:
+                    - "lambda:InvokeFunction"
+                  Resource: "*" 
+                -
+                  Sid: "CWLogDelivery"
+                  Effect: Allow 
+                  Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogDelivery"
+                  - "logs:GetLogDelivery"
+                  - "logs:UpdateLogDelivery"
+                  - "logs:DeleteLogDelivery"
+                  - "logs:ListLogDeliveries"
+                  - "logs:PutResourcePolicy"
+                  - "logs:DescribeResourcePolicies"
+                  - "logs:DescribeLogGroups"
+                  Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+                -
+                  Sid: "DynamoDBAccess"
+                  Effect: Allow
+                  Action:
+                    - "dynamodb:PutItem"
+                  Resource: !GetAtt TransactionsTable.Arn
+  
+  SQSTriggerLambda:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      EventSourceArn:
+        Fn::GetAtt:
+          - "SqsQueue"
+          - Arn
+      FunctionName:
+        Ref: TriggerStepFunctionsLambdaFunction
+
+  TriggerStepFunctionsLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Sid: "LambdaAccessToCreateCWLogGroup"
+            Effect: Allow 
+            Action: "logs:CreateLogGroup"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - 
+            Sid: "LambdaAccessToCreateCWLogEvents"
+            Effect: Allow 
+            Action:
+            - "logs:CreateLogStream"
+            - "logs:PutLogEvents"
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/TriggerStepFunctionsLambdaFunction:*"
+          -
+            Sid: "LambdaSQSPermissions"
+            Effect: Allow 
+            Action: 
+            - "sqs:ReceiveMessage"
+            - "sqs:DeleteMessage"
+            - "sqs:GetQueueAttributes"
+            Resource:
+              Fn::GetAtt: 
+                - "SqsQueue"
+                - "Arn"
+          -
+            Sid: "LambdaStateMachinePermissions"
+            Effect: Allow 
+            Action:
+            - "states:StartExecution"
+            Resource: !GetAtt StepFunctionsStateMachine.Arn
+
+  TriggerStepFunctionsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerStepFunctionsLambdaFunction
+      Role: !GetAtt TriggerStepFunctionsLambdaFunctionRole.Arn
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import random
+          import os
+
+          def lambda_handler(event, context):
+              print(event['Records'][0])
+              message_body = event['Records'][0]['body']
+              message_id = event['Records'][0]["messageAttributes"]["TransactionID"]["stringValue"]
+              print(message_body)
+              
+              input_json = "{\"id\" : \""+message_id+"\", \"transaction_message\" : \""+message_body+"\"}"
+              
+              unique_execution_string = str(random.randint(1, 1000000))
+              
+              print(input_json)
+              #"input": "{\"first_name\" : \"test\"}"
+              client = boto3.client('stepfunctions')
+              response = client.start_execution(
+                  stateMachineArn= os.environ['statemachinearn'],
+                  input=str(input_json),
+                  name="transaction-id-"+message_id+"-unique-execution-string-"+unique_execution_string
+              )
+      Environment:
+        Variables:
+          statemachinearn: !GetAtt StepFunctionsStateMachine.Arn
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: StepFunctionsStateMachine
+      DefinitionString: 
+        !Sub
+          - |-
+            {
+              "StartAt": "Lambda Invoke",
+              "States": {
+                "Lambda Invoke": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "OutputPath": "$.Payload",
+                  "Parameters": {
+                    "Payload.$": "$",
+                    "FunctionName": "${lambdaArn}"
+                  },
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException"
+                      ],
+                      "IntervalSeconds": 2,
+                      "MaxAttempts": 6,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Next": "API Gateway Request"
+                },
+                "API Gateway Request": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::apigateway:invoke",
+                  "Parameters": {
+                    "ApiEndpoint": "${apiGatewayId}",
+                    "Method": "GET",
+                    "Stage": "test",
+                    "Path": "/"
+                  },
+                  "ResultSelector": {
+                    "email.$": "$.ResponseBody[0].email"
+                  },
+                  "ResultPath": "$.email",
+                  "Next": "DynamoDB PutItem"
+                },
+                "DynamoDB PutItem": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::dynamodb:putItem",
+                  "Parameters": {
+                    "TableName": "transactions",
+                    "Item": {
+                      "id": {
+                        "S.$": "$.messageId"
+                      },
+                      "transaction_message": {
+                        "S.$": "$.transactionMessage"
+                      },
+                      "email": {
+                        "S.$": "$.email.email"
+                      }
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - lambdaArn: !GetAtt IntakeSingleTransactionLambdaFunction.Arn
+            apiGatewayId: !Sub "${DataEnrichmentApiGateway}.execute-api.${AWS::Region}.amazonaws.com"
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+     
+Parameters:
+  SshPublicKeyParameter:
+    Type: String
+    Description: Enter your SSH public key here 
+
+Outputs: 
+  QueueURL: 
+    Description: "URL of Amazon SQS Queue"
+    Value: 
+      Ref: "SqsQueue"
+  
+  TransferServerEndpoint:
+    Description: "Copy endpoint of Transfer server into Cyberduck connection details"
+    Value: !Join
+        - ''
+        - - !GetAtt 'SftpServer.ServerId'
+          - .server.transfer.
+          - !Ref 'AWS::Region'
+          - .amazonaws.com
