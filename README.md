@@ -2,10 +2,9 @@
 
 TODO: Fill this README out!
 
-Be sure to:
+The following diagram represents a simplified interaction flow between the AWS services:
 
-* Change the title in this README
-* Edit your repository description on GitHub
+![](./b2b-pipeline-architecture.jpg)
 
 ## Security
 
