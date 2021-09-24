@@ -2,6 +2,10 @@
 
 This repository contains an AWS Serverless Application Model (SAM) template to deploy a customizable, serverless B2B pipeline. 
 
+## Solution Overview
+
+This solution introduces a customizable, serverless architecture for B2B integrations using AWS Step Functions which provides both the code customizability of AWS Lambda with the low-code, visual building experience of Workflow Studio. This implementation supports both real-time and batch B2B integrations.
+
 The following diagram illustrates components and interactions of the example B2B pipeline architecture:
 
 ![](./b2b-pipeline-architecture.jpg)
