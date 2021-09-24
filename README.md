@@ -24,7 +24,7 @@ aws cloudformation delete-stack --stack-name <stack-name>
 ```
 
 Navigate to the S3 console and both Empty then Delete S3 buckets created
-from the stack: ```<stack-name>-cloudtrails3bucket-<uniqueId> and <stack-name>-sftpservers3bucket-<uniqueId>```
+from the stack: ```<stack-name>-cloudtrails3bucket-<uniqueId>``` and ```<stack-name>-sftpservers3bucket-<uniqueId>```
 
 Navigate to the CloudWatch console and delete the following log groups
 created from the stack: ```/aws/lambda/IntakeSingleTransactionLambdaFunction```,
